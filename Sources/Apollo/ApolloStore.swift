@@ -167,33 +167,129 @@ public class ApolloStore {
     }
   }
 
-  /// Loads the results for the given query from the cache.
+  /// Loads a cached result for the given operation.
+  ///
+  /// If the operation’s schema configuration provides custom cache resolution information
+  /// via `SchemaConfiguration.cacheResolverInfo(for:variables:)`, the store will attempt
+  /// to resolve the operation using that information. This enables cache hits for queries
+  /// that haven't been executed before, as long as the required data already exists in the cache.
+  ///
+  /// If no custom resolution is configured or if the cache doesn't contain the required data,
+  /// the store falls back to the default resolution strategy using the operation’s root cache key.
   ///
   /// - Parameters:
-  ///   - query: The query to load results for
-  ///   - resultHandler: The completion handler to execute on success or error
+  ///   - operation: The query operation to resolve from the cache.
+  ///   - callbackQueue: An optional dispatch queue on which to invoke the result handler.
+  ///   - resultHandler: A closure to be called with the operation result or an error.
   public func load<Operation: GraphQLOperation>(
-    _ operation: Operation,
-    callbackQueue: DispatchQueue? = nil,
-    resultHandler: @escaping GraphQLResultHandler<Operation.Data>
+      _ operation: Operation,
+      callbackQueue: DispatchQueue? = nil,
+      resultHandler: @escaping GraphQLResultHandler<Operation.Data>
   ) {
-    withinReadTransaction({ transaction in
-      let (data, dependentKeys) = try transaction.readObject(
-        ofType: Operation.Data.self,
-        withKey: CacheReference.rootCacheReference(for: Operation.operationType).key,
-        variables: operation.__variables,
-        accumulator: zip(GraphQLSelectionSetMapper<Operation.Data>(),
-                         GraphQLDependencyTracker())
-      )
-      
-      return GraphQLResult(
-        data: data,
-        extensions: nil,
-        errors: nil,
-        source:.cache,
-        dependentKeys: dependentKeys
-      )
-    }, callbackQueue: callbackQueue, completion: resultHandler)
+      let config = Operation.Data.Schema.configuration
+      let variables = operation.__variables
+
+      // Check the configuration hook for custom cache resolution info
+      if let resolverInfo = config.cacheResolverInfo(for: Operation.self, variables: variables) {
+          // Attempt to load using the custom cache key information
+          self.resolveUsingCustomCacheKey(
+              operation,
+              resolverInfo: resolverInfo,
+              variables: variables,
+              callbackQueue: callbackQueue,
+              resultHandler: resultHandler
+          )
+
+      } else {
+          // No custom resolution info, proceed with default loading
+          self.resolveUsingDefaultCacheKey(operation, callbackQueue: callbackQueue, resultHandler: resultHandler)
+      }
+  }
+
+  /// Attempts to resolve the operation by directly reading a single object
+  /// from the cache using a custom, canonical cache key.
+  ///
+  /// This enables cache hits for operations that haven't been executed before, as long as
+  /// the required object already exists in the cache (e.g., resolving `getOrder(id: "123")`
+  /// after a prior `getOrders()` call).
+  private func resolveUsingCustomCacheKey<Operation: GraphQLOperation>(
+      _ operation: Operation,
+      resolverInfo: CacheResolverInfo,
+      variables: Operation.Variables?,
+      callbackQueue: DispatchQueue?,
+      resultHandler: @escaping GraphQLResultHandler<Operation.Data>
+  ) {
+      withinReadTransaction({ transaction -> GraphQLResult<Operation.Data> in
+          // Read the target object directly from the cache using its canonical key.
+          let (selectionSet, dependentKeys) = try transaction.readObject(
+              ofType: resolverInfo.rootSelectionSetType,
+              withKey: resolverInfo.cacheKey,
+              variables: variables,
+              accumulator: zip(GraphQLSelectionSetMapper<Operation.Data>(), GraphQLDependencyTracker())
+          )
+
+          // Synthesize the expected root DataDict per the operation's Data type.
+          let rootDataDict: DataDict
+          let selectionData = selectionSet.__data
+          if let rootFieldKey = resolverInfo.rootFieldKey {
+              // Nest the resolved object under the specified field key.
+              rootDataDict = DataDict(
+                  data: [rootFieldKey: selectionData],
+                  fulfilledFragments: [ObjectIdentifier(Operation.Data.self)]
+              )
+          } else {
+              // Treat the target object as the root of the response.
+              rootDataDict = DataDict(
+                  data: selectionData._data,
+                  fulfilledFragments: selectionData._fulfilledFragments.union([ObjectIdentifier(Operation.Data.self)]),
+                  deferredFragments: selectionData._deferredFragments
+              )
+          }
+
+          return GraphQLResult(
+              data: Operation.Data(_dataDict: rootDataDict),
+              extensions: nil,
+              errors: nil,
+              source: .cache,
+              dependentKeys: dependentKeys
+          )
+      }, callbackQueue: callbackQueue) { result in
+          switch result {
+          case .success(let graphQLResult):
+              resultHandler(.success(graphQLResult))
+          case .failure:
+              // Fall back to the default resolution path if custom resolution fails.
+              self.resolveUsingDefaultCacheKey(operation, callbackQueue: callbackQueue, resultHandler: resultHandler)
+          }
+      }
+  }
+
+  /// Resolves the operation using the default cache key strategy,
+  /// based on the operation’s root object.
+  ///
+  /// This is the standard cache resolution path used when no custom
+  /// cache key resolution is configured or when a custom resolution attempt fails.
+  private func resolveUsingDefaultCacheKey<Operation: GraphQLOperation>(
+      _ operation: Operation,
+      callbackQueue: DispatchQueue? = nil,
+      resultHandler: @escaping GraphQLResultHandler<Operation.Data>
+  ) {
+      withinReadTransaction({ transaction in
+          let (data, dependentKeys) = try transaction.readObject(
+              ofType: Operation.Data.self,
+              withKey: CacheReference.rootCacheReference(for: Operation.operationType).key,
+              variables: operation.__variables,
+              accumulator: zip(GraphQLSelectionSetMapper<Operation.Data>(), GraphQLDependencyTracker())
+          )
+
+          return GraphQLResult(
+              data: data,
+              extensions: nil,
+              errors: nil,
+              source: .cache,
+              dependentKeys: dependentKeys
+          )
+      }, callbackQueue: callbackQueue, completion: resultHandler)
   }
 
   public enum Error: Swift.Error {
