@@ -40,4 +40,81 @@ public protocol SchemaConfiguration {
   /// - Returns: A ``CacheKeyInfo`` describing the computed cache key for the response object.
   static func cacheKeyInfo(for type: Object, object: ObjectData) -> CacheKeyInfo?
 
+  /// Provides metadata for resolving a GraphQL operation by directly reading a single object
+  /// from the normalized cache using its canonical cache key.
+  ///
+  /// This enables cache hits for operations that haven't been executed before,
+  /// as long as the required object data already exists in the cache (e.g., resolving
+  /// `getOrder(id: "123")` after a previous `getOrders()` call).
+  ///
+  /// - Parameters:
+  ///   - operation: The type of the operation being executed.
+  ///   - variables: The runtime variables associated with the operation.
+  /// - Returns: ``CacheResolverInfo`` if custom cache resolution should be attempted, otherwise `nil`.
+  static func cacheResolverInfo<Operation: GraphQLOperation>( for operation: Operation.Type, variables: Operation.Variables?) -> CacheResolverInfo?
+}
+
+/// Describes how to resolve a query operation by directly reading a normalized object
+/// from the cache using its canonical cache key.
+public struct CacheResolverInfo {
+    /// The canonical cache key of the target object (e.g., "Order:123").
+    /// This key must match the value computed by `SchemaConfiguration.cacheKeyInfo(...)`.
+    public let cacheKey: String
+
+    /// The type of root-level selection set used to read and interpret the object at `cacheKey`.
+    /// This type defines the structure of the object that will be read from the cache,
+    /// and must include all fields necessary to satisfy the query being resolved.
+    ///
+    /// As an example, if your query returns an `Order` object with a fragment like:
+    /// ```graphql
+    /// fragment OrderFragment on Order {
+    ///   id
+    ///   status
+    ///   total
+    /// }
+    ///
+    /// query GetOrder {
+    ///   order { ...OrderFragment }
+    /// }
+    /// ```
+    /// then `rootSelectionSetType` should be `OrderFragment.self`.
+    ///
+    /// The resolved object will be wrapped under `rootFieldKey` (if provided) to synthesize
+    /// a `GraphQLResult` compatible with the operation’s expected `Data` type.
+    public let rootSelectionSetType: RootSelectionSet.Type
+
+    /// The name of the top-level field in the operation’s `Data` structure where the resolved object should be placed.
+    ///
+    /// For example, in a query like:
+    /// ```graphql
+    /// query GetOrder {
+    ///   order { ...OrderFragment }
+    /// }
+    /// ```
+    /// the corresponding field in the generated `Data` type would be `order`,
+    /// so `rootFieldKey` should be set to `"order"`.
+    ///
+    /// If this value is `nil`, the resolved object is treated as the root of the response.
+    public let rootFieldKey: String?
+    
+    
+    public init(
+        cacheKey: String,
+        rootSelectionSetType: RootSelectionSet.Type,
+        rootFieldKey: String? = nil
+    ) {
+        self.cacheKey = cacheKey
+        self.rootSelectionSetType = rootSelectionSetType
+        self.rootFieldKey = rootFieldKey
+    }
+}
+
+
+public extension SchemaConfiguration {
+    static func cacheResolverInfo<Operation: GraphQLOperation>(
+        for operation: Operation.Type,
+        variables: Operation.Variables?
+    ) -> CacheResolverInfo? {
+        return nil // Default: no custom resolution
+    }
 }
